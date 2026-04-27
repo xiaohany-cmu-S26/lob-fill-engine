@@ -33,7 +33,7 @@ import pandas as pd
 # ── Schema constants ───────────────────────────────────────────────────────────
 
 MAX_DEPTH        = 10     # price levels per side in the LOBSTER files
-FILL_HORIZON_SEC = 5.0    # look-forward window for fill labels (seconds)
+FILL_HORIZON_SEC = 1.0    # look-forward window for fill labels (seconds)
 EMBARGO_SEC      = 30.0   # seconds to drop at the start of each val/test period
 AUCTION_ROWS     = 60     # leading rows to drop (opening auction artefacts)
 
@@ -262,13 +262,19 @@ def construct_fill_labels(msg: pd.DataFrame,
     """
     Build binary fill labels for every limit-order submission (event_type == 1).
 
-    For each submission a synthetic passive order is placed at the current
-    best bid (buy) or best ask (sell).  Label = 1 if any execution event
-    (type 4 or 5) at-or-through that price occurs within fill_horizon_sec.
+    Fill condition (size-aware):
+      A passive order of size S placed at the back of the queue fills only when
+      enough execution volume has cleared the entire queue ahead of it AND the
+      order itself.  Required cumulative execution volume within the horizon:
+          fill_threshold = queue_ahead + order_size
+      where queue_ahead = bid_v1 (buy) or ask_v1 (sell) at the moment of
+      submission, and order_size = msg["size"] for that limit order event.
 
-    Implementation: O(M log N) via numpy.searchsorted on the timestamp array,
-    where M = number of limit orders and N = total events.  This replaces the
-    original O(M·N) DataFrame-filter loop.
+    This is more accurate than the simpler "price touch" condition because a
+    10-share order and a 10,000-share order have very different fill chances
+    even at the same price level and queue position.
+
+    Implementation: O(M log N) via numpy.searchsorted on the timestamp array.
 
     Parameters
     ----------
@@ -282,30 +288,39 @@ def construct_fill_labels(msg: pd.DataFrame,
         timestamp   : pd.Timestamp  time of the submission
         direction   : int   1=buy, -1=sell
         entry_price : float  best bid or ask at submission (USD)
-        filled      : int   1 = filled within horizon, 0 = not
+        order_size  : int   size of the submitted limit order (shares)
+        filled      : int   1 = fully filled within horizon, 0 = not
         book_idx    : int   positional index into msg / book for this row
     """
     # Pre-extract numpy arrays — avoids repeated pandas indexing in the loop
-    ts_ns       = msg["timestamp"].values.astype(np.int64)   # nanoseconds
-    horizon_ns  = int(fill_horizon_sec * 1e9)
+    ts_ns      = msg["timestamp"].values.astype(np.int64)   # nanoseconds
+    horizon_ns = int(fill_horizon_sec * 1e9)
 
-    prices      = msg["price"].values
-    exec_mask   = msg["event_type"].isin([4, 5]).values
-    directions  = msg["direction"].values
-    bid_p1      = book["bid_p1"].values
-    ask_p1      = book["ask_p1"].values
-    timestamps  = msg["timestamp"].values
+    prices     = msg["price"].values
+    sizes      = msg["size"].values                          # shares per event
+    exec_mask  = msg["event_type"].isin([4, 5]).values
+    directions = msg["direction"].values
+    bid_p1     = book["bid_p1"].values
+    ask_p1     = book["ask_p1"].values
+    bid_v1     = book["bid_v1"].values                      # queue depth, buy side
+    ask_v1     = book["ask_v1"].values                      # queue depth, sell side
+    timestamps = msg["timestamp"].values
 
     limit_idxs  = np.where(msg["event_type"].values == 1)[0]
     m           = len(limit_idxs)
 
     filled_arr      = np.zeros(m, dtype=np.int8)
     entry_price_arr = np.empty(m, dtype=np.float64)
+    order_size_arr  = sizes[limit_idxs].copy()
 
     for k, i in enumerate(limit_idxs):
-        d = directions[i]
+        d           = directions[i]
         entry_price = bid_p1[i] if d == 1 else ask_p1[i]
         entry_price_arr[k] = entry_price
+
+        # Volume needed to fully fill: clear queue ahead + fill this order
+        queue_ahead     = bid_v1[i] if d == 1 else ask_v1[i]
+        fill_threshold  = int(queue_ahead) + int(sizes[i])
 
         lo = i + 1
         hi = int(np.searchsorted(ts_ns, ts_ns[i] + horizon_ns, side="right"))
@@ -313,15 +328,19 @@ def construct_fill_labels(msg: pd.DataFrame,
         if lo < hi:
             w_exec   = exec_mask[lo:hi]
             w_prices = prices[lo:hi]
+            w_sizes  = sizes[lo:hi]
             if d == 1:
-                filled_arr[k] = np.any(w_exec & (w_prices >= entry_price))
+                at_price = w_exec & (w_prices >= entry_price)
             else:
-                filled_arr[k] = np.any(w_exec & (w_prices <= entry_price))
+                at_price = w_exec & (w_prices <= entry_price)
+            cum_vol = int(np.sum(w_sizes[at_price]))
+            filled_arr[k] = int(cum_vol >= fill_threshold)
 
     return pd.DataFrame({
         "timestamp":   timestamps[limit_idxs],
         "direction":   directions[limit_idxs],
         "entry_price": entry_price_arr,
+        "order_size":  order_size_arr,
         "filled":      filled_arr.astype(np.int8),
         "book_idx":    limit_idxs,
     })
@@ -379,6 +398,7 @@ def build_dataset(file_pairs: list[dict],
         day_df["filled"]      = labels["filled"].values
         day_df["timestamp"]   = labels["timestamp"].values
         day_df["entry_price"] = labels["entry_price"].values
+        day_df["order_size"]  = labels["order_size"].values
         day_df["direction"]   = labels["direction"].values
         day_df["ticker"]      = ticker
         day_df["date"]        = date
@@ -482,3 +502,66 @@ def apply_vol_regime(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     Returns a copy of df with an added 'vol_regime' column (int 0/1).
     """
     return df.assign(vol_regime=(df["local_vol"] > threshold).astype(np.int8))
+
+
+# ── Sample uniqueness weights (Lopez de Prado, AFML Ch. 4) ────────────────────
+
+def compute_uniqueness_weights(
+    df: pd.DataFrame,
+    fill_horizon_sec: float = FILL_HORIZON_SEC,
+) -> np.ndarray:
+    """
+    Per-row sample weights that down-weight observations whose label-window
+    horizons overlap with neighbouring observations.
+
+    Why this matters
+    ----------------
+    Two synthetic limit orders submitted within `fill_horizon_sec` of each
+    other share most of the same look-forward execution stream — their labels
+    are highly correlated, so treating them as i.i.d. inflates the effective
+    sample size and biases CV scores. Lopez de Prado (AFML Ch. 4) defines
+    *uniqueness* as 1 / (overlap count) computed at every event in the label
+    horizon.
+
+    This implementation is the simpler per-sample averaged-uniqueness:
+        weight_i = 1 / N_i,
+    where N_i is the number of observations whose [t, t + horizon] windows
+    contain t_i. Computed in O(n log n) via two sorted-array scans
+    (per-day, since horizons cannot cross day boundaries).
+
+    Parameters
+    ----------
+    df               : split DataFrame with 'timestamp' and 'date' columns
+    fill_horizon_sec : same horizon used in construct_fill_labels
+
+    Returns
+    -------
+    np.ndarray of shape (len(df),) with weights in (0, 1].
+    """
+    weights = np.ones(len(df), dtype=np.float64)
+    if len(df) == 0:
+        return weights
+
+    # Use positional indices so we don't depend on the caller's index labels
+    df_pos = df.reset_index(drop=True)
+    horizon_ns = np.int64(fill_horizon_sec * 1e9)
+
+    for _, grp in df_pos.groupby("date", sort=False):
+        ts = grp["timestamp"].values.astype("datetime64[ns]").astype(np.int64)
+        order = np.argsort(ts, kind="stable")
+        ts_sorted = ts[order]
+
+        # For each i, count j where ts[j] in [ts[i] - horizon, ts[i] + horizon]
+        # using two binary searches on the sorted timestamp array.
+        lo = np.searchsorted(ts_sorted, ts_sorted - horizon_ns, side="left")
+        hi = np.searchsorted(ts_sorted, ts_sorted + horizon_ns, side="right")
+        counts_sorted = (hi - lo).astype(np.float64)
+
+        # Map counts back to original (within-group) positions
+        counts = np.empty_like(counts_sorted)
+        counts[order] = counts_sorted
+
+        positions = grp.index.to_numpy()  # positional after reset_index above
+        weights[positions] = 1.0 / np.maximum(counts, 1.0)
+
+    return weights
