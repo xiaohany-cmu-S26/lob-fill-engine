@@ -33,7 +33,7 @@ import pandas as pd
 # ── Schema constants ───────────────────────────────────────────────────────────
 
 MAX_DEPTH        = 10     # price levels per side in the LOBSTER files
-FILL_HORIZON_SEC = 1.0    # look-forward window for fill labels (seconds)
+FILL_HORIZON_SEC = 3.0    # look-forward window for fill labels (seconds)
 EMBARGO_SEC      = 30.0   # seconds to drop at the start of each val/test period
 AUCTION_ROWS     = 60     # leading rows to drop (opening auction artefacts)
 
@@ -546,7 +546,11 @@ def compute_uniqueness_weights(
     df_pos = df.reset_index(drop=True)
     horizon_ns = np.int64(fill_horizon_sec * 1e9)
 
-    for _, grp in df_pos.groupby("date", sort=False):
+    # Group by (date, ticker) when multiple stocks are present so that
+    # events from different stocks on the same calendar day are never counted
+    # as overlapping — their execution streams are independent.
+    group_keys = ["date", "ticker"] if "ticker" in df_pos.columns else ["date"]
+    for _, grp in df_pos.groupby(group_keys, sort=False):
         ts = grp["timestamp"].values.astype("datetime64[ns]").astype(np.int64)
         order = np.argsort(ts, kind="stable")
         ts_sorted = ts[order]
@@ -565,3 +569,128 @@ def compute_uniqueness_weights(
         weights[positions] = 1.0 / np.maximum(counts, 1.0)
 
     return weights
+
+
+# ── Fractional fill labels ─────────────────────────────────────────────────────
+
+def construct_fill_fraction_labels(
+    msg: pd.DataFrame,
+    book: pd.DataFrame,
+    fill_horizon_sec: float = FILL_HORIZON_SEC,
+) -> pd.DataFrame:
+    """
+    Like construct_fill_labels but returns fill_fraction ∈ [0, 1] instead of
+    a binary flag.
+
+    Fill fraction for order i:
+        vol_absorbed  = max(0, cumulative_exec_volume_at_price − queue_ahead)
+        fill_fraction = min(vol_absorbed, order_size) / order_size
+
+    0.0 → no execution volume reached this order's queue position
+    0.5 → half the order size was absorbed by executions
+    1.0 → the full order was filled
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        timestamp     : pd.Timestamp
+        direction     : int
+        entry_price   : float
+        order_size    : int
+        fill_fraction : float  target in [0, 1]
+        book_idx      : int
+    """
+    ts_ns      = msg["timestamp"].values.astype(np.int64)
+    horizon_ns = int(fill_horizon_sec * 1e9)
+
+    prices     = msg["price"].values
+    sizes      = msg["size"].values
+    exec_mask  = msg["event_type"].isin([4, 5]).values
+    directions = msg["direction"].values
+    bid_p1     = book["bid_p1"].values
+    ask_p1     = book["ask_p1"].values
+    bid_v1     = book["bid_v1"].values
+    ask_v1     = book["ask_v1"].values
+    timestamps = msg["timestamp"].values
+
+    limit_idxs      = np.where(msg["event_type"].values == 1)[0]
+    m               = len(limit_idxs)
+    frac_arr        = np.zeros(m, dtype=np.float32)
+    entry_price_arr = np.empty(m, dtype=np.float64)
+    order_size_arr  = sizes[limit_idxs].copy()
+
+    for k, i in enumerate(limit_idxs):
+        d           = directions[i]
+        entry_price = bid_p1[i] if d == 1 else ask_p1[i]
+        entry_price_arr[k] = entry_price
+
+        queue_ahead = float(bid_v1[i] if d == 1 else ask_v1[i])
+        order_sz    = float(sizes[i])
+
+        lo = i + 1
+        hi = int(np.searchsorted(ts_ns, ts_ns[i] + horizon_ns, side="right"))
+
+        if lo < hi and order_sz > 0:
+            w_exec   = exec_mask[lo:hi]
+            w_prices = prices[lo:hi]
+            w_sizes  = sizes[lo:hi]
+            at_price = (w_exec & (w_prices >= entry_price) if d == 1
+                        else w_exec & (w_prices <= entry_price))
+            cum_vol      = float(np.sum(w_sizes[at_price]))
+            vol_absorbed = max(0.0, cum_vol - queue_ahead)
+            frac_arr[k]  = min(vol_absorbed, order_sz) / order_sz
+
+    return pd.DataFrame({
+        "timestamp":    timestamps[limit_idxs],
+        "direction":    directions[limit_idxs],
+        "entry_price":  entry_price_arr,
+        "order_size":   order_size_arr,
+        "fill_fraction": frac_arr,
+        "book_idx":     limit_idxs,
+    })
+
+
+def build_dataset_fractional(
+    file_pairs: list[dict],
+    ticker: str,
+    fill_horizon_sec: float = FILL_HORIZON_SEC,
+) -> pd.DataFrame:
+    """
+    Like build_dataset() but uses construct_fill_fraction_labels so the target
+    column is 'fill_fraction' (float [0, 1]) instead of binary 'filled'.
+
+    Suitable for regression models (Ridge, RandomForestRegressor,
+    HistGradientBoostingRegressor).
+    """
+    frames = []
+    for fp in file_pairs:
+        date = fp["date"]
+        try:
+            msg, book = load_lobster(fp["msg"], fp["ob"], date)
+        except Exception as e:
+            print(f"[build_dataset_fractional] skipping {ticker} {date}: {e}")
+            continue
+
+        labels   = construct_fill_fraction_labels(msg, book, fill_horizon_sec)
+        features = compute_features(msg, book)
+
+        if labels.empty:
+            continue
+
+        lo_feats = features.iloc[labels["book_idx"]].reset_index(drop=True)
+
+        day_df = lo_feats.copy()
+        day_df["fill_fraction"] = labels["fill_fraction"].values
+        day_df["timestamp"]     = labels["timestamp"].values
+        day_df["entry_price"]   = labels["entry_price"].values
+        day_df["order_size"]    = labels["order_size"].values
+        day_df["direction"]     = labels["direction"].values
+        day_df["ticker"]        = ticker
+        day_df["date"]          = date
+        day_df["day_of_week"]   = pd.Timestamp(date).day_of_week
+
+        frames.append(day_df)
+
+    if not frames:
+        raise ValueError(f"No valid days loaded for {ticker}.")
+    return pd.concat(frames, ignore_index=True)

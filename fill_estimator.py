@@ -91,6 +91,9 @@ class FillEstimator:
     feature_names    : ordered list of feature columns the model expects
     vol_threshold    : training-set median of local_vol (for vol_regime inference)
     fill_horizon_sec : labelled fill window (seconds) — embedded for traceability
+    calibrator       : optional Platt scaler (LogisticRegression on raw scores)
+                       fitted on the validation set; corrects systematic bias in
+                       the raw predicted probabilities without changing ranking
     """
 
     def __init__(
@@ -98,12 +101,19 @@ class FillEstimator:
         model,
         feature_names: list[str],
         vol_threshold: float,
-        fill_horizon_sec: float = 1.0,
+        fill_horizon_sec: float = 3.0,
+        calibrator=None,
     ):
         self.model            = model
         self.feature_names    = feature_names
         self.vol_threshold    = vol_threshold
         self.fill_horizon_sec = fill_horizon_sec
+        self.calibrator       = calibrator   # None → raw scores, otherwise Platt
+
+    def _apply_calibrator(self, raw: np.ndarray) -> np.ndarray:
+        if self.calibrator is None:
+            return raw
+        return self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
 
     # ── Low-level: caller passes all model features pre-computed ──────────────
 
@@ -113,23 +123,27 @@ class FillEstimator:
         already contains every encoded column the model expects.
 
         vol_regime is inferred from local_vol if omitted.
+        Applies Platt calibration automatically if a calibrator is stored.
         """
         s = dict(state)
         if "vol_regime" not in s and "local_vol" in s:
             s["vol_regime"] = int(s["local_vol"] > self.vol_threshold)
         row = pd.DataFrame([{f: s[f] for f in self.feature_names}])
-        return float(self.model.predict_proba(row)[0, 1])
+        raw = self.model.predict_proba(row)[:, 1]
+        return float(self._apply_calibrator(raw)[0])
 
     def predict_proba_batch(self, df: pd.DataFrame) -> np.ndarray:
         """
         Batch fill probabilities for backtesting.
 
         df must have all feature columns; vol_regime is inferred if absent.
+        Applies Platt calibration automatically if a calibrator is stored.
         """
         df = df.copy()
         if "vol_regime" not in df.columns and "local_vol" in df.columns:
             df["vol_regime"] = (df["local_vol"] > self.vol_threshold).astype(int)
-        return self.model.predict_proba(df[self.feature_names])[:, 1]
+        raw = self.model.predict_proba(df[self.feature_names])[:, 1]
+        return self._apply_calibrator(raw)
 
     # ── High-level convenience API ────────────────────────────────────────────
 

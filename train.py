@@ -5,17 +5,19 @@ Run:  python train.py
 
 Pipeline (strict no-leakage order)
 -----------------------------------
-1.  Load AAPL LOBSTER data for all available trading days
+1.  Load AAPL + CSCO LOBSTER data; combine and sort chronologically
 2.  Build dataset: limit-order labels + stateless features per day
 3.  Chronological split 70/15/15 with purging and embargoing — NO fitting before this step
 4.  Fit vol_regime threshold on training set only; apply to all three splits
 5.  Feature selection on training set only: MI ranking, RFECV, Genetic Algorithm
 6.  Train three models on primary features (GA ∪ RFECV)
-7.  Evaluate: tick-AUC, day-level AUC ± std, Brier score
-8.  Generate all plots (plots/ directory)
-9.  Experiment 1 — with vs without intraday seasonality features
-10. Experiment 2 — with vs without macro regime features
-11. Save best model (GBM) as FillEstimator → models/fill_estimator.pkl
+7.  Platt scaling: fit calibrator on validation set scores — fixes systematic
+    probability bias without touching ranking (AUC unchanged)
+8.  Evaluate: tick-AUC, day-level AUC ± std, Brier score (raw + calibrated)
+9.  Generate all plots (plots/ directory)
+10. Experiment 1 — with vs without intraday seasonality features
+11. Experiment 2 — with vs without macro regime features
+12. Save best model (GBM + Platt calibrator) as FillEstimator → models/fill_estimator.pkl
 """
 
 import os
@@ -593,19 +595,31 @@ def main() -> None:
 
     t_start = time.time()
 
-    # ── Step 1: Load raw data ──────────────────────────────────────────────────
+    # ── Step 1: Load raw data (AAPL + CSCO combined) ──────────────────────────
     print("=" * 65)
-    print("STEP 1 — Load AAPL data and build dataset")
+    print("STEP 1 — Load AAPL + CSCO data and build combined dataset")
     print("=" * 65)
     t0 = time.time()
-    pairs = discover_files(AAPL_DIR)
-    print(f"  Found {len(pairs)} trading days in {AAPL_DIR}")
-    df = build_dataset(pairs, "AAPL")
+
+    aapl_pairs = discover_files(AAPL_DIR)
+    print(f"  AAPL: {len(aapl_pairs)} trading days")
+    df_aapl = build_dataset(aapl_pairs, "AAPL")
+
+    csco_pairs = discover_files(CSCO_DIR)
+    print(f"  CSCO: {len(csco_pairs)} trading days")
+    df_csco = build_dataset(csco_pairs, "CSCO")
+
+    df = (pd.concat([df_aapl, df_csco], ignore_index=True)
+            .sort_values("date")
+            .reset_index(drop=True))
+
     n_days = df["date"].nunique()
-    print(f"  Dataset: {len(df):,} limit-order rows  ·  {n_days} days  "
+    print(f"  Combined: {len(df):,} rows  ·  {n_days} unique dates  "
           f"({time.time()-t0:.1f}s)")
     print(f"  Date range: {df['date'].min()} → {df['date'].max()}")
-    print(f"  Overall fill rate: {df['filled'].mean():.3f}")
+    print(f"  Fill rate — AAPL: {df_aapl['filled'].mean():.3f}  "
+          f"CSCO: {df_csco['filled'].mean():.3f}  "
+          f"combined: {df['filled'].mean():.3f}")
 
     # ── Step 2: Chronological split — NO fitting before this ──────────────────
     print("\n── Chronological split (70 / 15 / 15 by date, purge + embargo) ──────")
@@ -685,9 +699,32 @@ def main() -> None:
         _fit_with_weights(model, X_tr, y_train, sample_weight=train_sw)
         print(f"done ({time.time()-t3:.0f}s)")
 
-    # ── Step 6: Evaluate ───────────────────────────────────────────────────────
+    # ── Step 6: Platt scaling — fit on validation set ─────────────────────────
+    # A LogisticRegression maps raw model scores → calibrated probabilities.
+    # Fitted on val (not train) so the calibration sees out-of-sample scores.
+    # AUC is rank-invariant and won't change; bias ratio should approach 1.0.
     print("\n" + "=" * 65)
-    print("STEP 4 — Evaluation")
+    print("STEP 4 — Platt calibration (fitted on validation set)")
+    print("=" * 65)
+
+    calibrators: dict[str, LogisticRegression] = {}
+    X_val_primary = val_df[primary_features]
+    for name, model in models.items():
+        raw_val = model.predict_proba(X_val_primary)[:, 1].reshape(-1, 1)
+        platt = LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
+        platt.fit(raw_val, val_df["filled"])
+        calibrators[name] = platt
+        # Quick sanity: calibrated bias ratio on val
+        cal_val = platt.predict_proba(raw_val)[:, 1]
+        ratio = cal_val.sum() / val_df["filled"].sum()
+        print(f"  {name:<22}  val bias ratio after calibration: {ratio:.4f}")
+
+    joblib.dump(calibrators, os.path.join(MODELS_DIR, "platt_calibrators.pkl"))
+    print(f"  Saved calibrators → models/platt_calibrators.pkl")
+
+    # ── Step 7: Evaluate ───────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("STEP 5 — Evaluation")
     print("=" * 65)
 
     header = (f"  {'Model':<22} {'Tick AUC':>9} {'Day AUC':>9} {'±Std':>7} "
@@ -696,7 +733,7 @@ def main() -> None:
 
     test_results: dict[str, dict] = {}
     for split_name, split_df in [("Validation", val_df), ("Test", test_df)]:
-        print(f"\n  {split_name} set:")
+        print(f"\n  {split_name} set (raw scores):")
         print(header)
         print(sep)
         for name, model in models.items():
@@ -706,6 +743,26 @@ def main() -> None:
                   f"{r['day_brier_mean']:>10.4f} {r['day_brier_std']:>7.4f}")
             if split_name == "Test":
                 test_results[name] = r
+
+        # Calibrated metrics — AUC unchanged, Brier and bias ratio improve
+        print(f"\n  {split_name} set (Platt calibrated):")
+        print(header)
+        print(sep)
+        for name, model in models.items():
+            raw_probs = model.predict_proba(split_df[primary_features])[:, 1]
+            cal_probs = calibrators[name].predict_proba(
+                raw_probs.reshape(-1, 1))[:, 1]
+            tmp = split_df[["date", "filled"]].copy()
+            tmp["prob"] = cal_probs
+            tick_auc   = roc_auc_score(split_df["filled"], cal_probs)
+            tick_brier = brier_score_loss(split_df["filled"], cal_probs)
+            day_auc_m, day_auc_s     = day_level_metric(tmp, "auc")
+            day_brier_m, day_brier_s = day_level_metric(tmp, "brier")
+            bias_ratio = cal_probs.sum() / split_df["filled"].sum()
+            print(f"  {name:<22} {tick_auc:>9.4f} {day_auc_m:>9.4f} "
+                  f"{day_auc_s:>7.4f} {tick_brier:>11.4f} "
+                  f"{day_brier_m:>10.4f} {day_brier_s:>7.4f}  "
+                  f"bias={bias_ratio:.3f}")
 
     # Save per-order test-set predictions for downstream sanity-checking and
     # for the MM-simulator backtest. One row per limit order placed during the
@@ -722,9 +779,9 @@ def main() -> None:
     pred_df.to_csv(pred_path, index=False)
     print(f"\n  Test predictions saved → {pred_path}")
 
-    # ── Step 7: Plots ──────────────────────────────────────────────────────────
+    # ── Step 8: Plots ──────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("STEP 5 — Plots")
+    print("STEP 6 — Plots")
     print("=" * 65)
 
     plot_roc_curves(models, test_df, features_dict)
@@ -732,17 +789,17 @@ def main() -> None:
     for name, model in models.items():
         plot_importances(model, primary_features, name)
 
-    # ── Step 8: Experiments ────────────────────────────────────────────────────
+    # ── Step 9: Experiments ────────────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("STEP 6 — Experiments")
+    print("STEP 7 — Experiments")
     print("=" * 65)
     run_experiment_1(train_df, test_df)
     run_experiment_2(train_df, test_df)
     run_experiment_3(PLOTS_DIR)
 
-    # ── Step 9: Save best model ────────────────────────────────────────────────
+    # ── Step 10: Save best model ───────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print("STEP 7 — Save FillEstimator")
+    print("STEP 8 — Save FillEstimator")
     print("=" * 65)
 
     best = FillEstimator(
@@ -750,6 +807,7 @@ def main() -> None:
         feature_names=primary_features,
         vol_threshold=vol_thresh,
         fill_horizon_sec=FILL_HORIZON_SEC,
+        calibrator=calibrators["GBM"],
     )
     est_path = os.path.join(MODELS_DIR, "fill_estimator.pkl")
     best.save(est_path)

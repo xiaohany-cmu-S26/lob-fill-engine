@@ -31,7 +31,7 @@ TICKER_DIRS = {
                          "output-2023-07", "0", "0", "75"),
 }
 
-from lobster_data import OB_COLS, OB_PRICE_COLS, load_lobster
+from lobster_data import OB_COLS, OB_PRICE_COLS, load_lobster, AUCTION_ROWS
 
 _OPEN, _CLOSE = 34_200.0, 57_600.0   # seconds from midnight
 
@@ -129,6 +129,9 @@ def load_day(ticker: str, date: str):
         # OB-only day: read book, synthesise an approximate time axis
         ob    = pd.read_csv(info["ob"], header=None, names=OB_COLS)
         ob[OB_PRICE_COLS] = ob[OB_PRICE_COLS] / 10_000
+        # Apply same quality filters as load_lobster (book-side only)
+        ob = ob[ob["ask_p1"] > ob["bid_p1"]].reset_index(drop=True)
+        ob = ob.iloc[AUCTION_ROWS:].reset_index(drop=True)
         n     = len(ob)
         times = np.linspace(_OPEN, _CLOSE, n)
         msg   = None
@@ -201,22 +204,29 @@ def build_lob_chart(row: pd.Series, depth: int, ticker: str,
     bid_cum = list(np.cumsum(bid_sz))
     mid     = (ask_px[0] + bid_px[0]) / 2.0
 
+    # Normalise each side to 0–100 % so neither side becomes invisible when
+    # absolute volumes are heavily imbalanced (e.g. at the open).
+    ask_total = ask_cum[-1] if ask_cum[-1] > 0 else 1.0
+    bid_total = bid_cum[-1] if bid_cum[-1] > 0 else 1.0
+    ask_pct = [v / ask_total * 100 for v in ask_cum]
+    bid_pct = [v / bid_total * 100 for v in bid_cum]
+
     title_txt = ticker
     if not has_real_time:
         title_txt += "  <sup style='color:#f97316;font-size:11px'>OB only · approx time</sup>"
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=ask_px, y=ask_cum, mode="lines", name="Ask",
+        x=ask_px, y=ask_pct, customdata=ask_cum, mode="lines", name="Ask",
         line=dict(color=_COLORS["ask_line"], width=2, shape="hv"),
         fill="tozeroy", fillcolor=_COLORS["ask_fill"],
-        hovertemplate="Ask %{x:.2f}  qty=%{y:,}<extra></extra>",
+        hovertemplate="Ask $%{x:.2f}  cumvol=%{customdata:,}<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
-        x=bid_px, y=bid_cum, mode="lines", name="Bid",
+        x=bid_px, y=bid_pct, customdata=bid_cum, mode="lines", name="Bid",
         line=dict(color=_COLORS["bid_line"], width=2, shape="hv"),
         fill="tozeroy", fillcolor=_COLORS["bid_fill"],
-        hovertemplate="Bid %{x:.2f}  qty=%{y:,}<extra></extra>",
+        hovertemplate="Bid $%{x:.2f}  cumvol=%{customdata:,}<extra></extra>",
     ))
     fig.add_vline(x=mid, line=dict(color=_COLORS["mid_line"], width=1, dash="dot"))
 
@@ -225,8 +235,9 @@ def build_lob_chart(row: pd.Series, depth: int, ticker: str,
         title=dict(text=title_txt, font=dict(size=14), x=0.5),
         xaxis=dict(title="Price ($)", gridcolor=_COLORS["grid"],
                    tickformat=".2f", tickfont=dict(size=10)),
-        yaxis=dict(title="Cumulative Volume",
-                   gridcolor=_COLORS["grid"], tickfont=dict(size=10)),
+        yaxis=dict(title="Cumulative Volume (% of side)",
+                   gridcolor=_COLORS["grid"], tickfont=dict(size=10),
+                   range=[0, 105]),
     )
     return fig
 
