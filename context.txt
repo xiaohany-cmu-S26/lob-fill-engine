@@ -1,0 +1,243 @@
+# LOB Fill Probability Estimator — Claude Code Context
+# CMU Data Science Final Project | David Yu
+
+---
+
+## PROJECT GOAL
+
+Build a limit order book (LOB) fill probability estimator using one month of
+LOBSTER tick data (AAPL and CSCO). This is the empirical fill layer of a larger
+LOB + Market Making simulator. The estimator predicts P(fill within 5 seconds)
+for a synthetic limit order placed at the best bid or ask.
+
+---
+
+## DATA
+
+### Source
+LOBSTER (lobsterdata.com) — one month of NASDAQ tick data for AAPL and CSCO.
+Data obtained from LOBSTER CEO for academic use.
+
+### File Format
+Each stock/day produces two paired CSV files:
+
+MESSAGE FILE columns (no header):
+  timestamp, event_type, order_id, size, price, direction
+  - timestamp: seconds since midnight (float)
+  - event_type: 1=new limit, 2=cancel partial, 3=cancel full,
+                4=exec visible, 5=exec hidden, 7=trading halt
+  - price: integer ticks (divide by 10000 to get dollars)
+  - direction: 1=buy, -1=sell
+
+ORDERBOOK FILE columns (no header):
+  ask_p1, ask_v1, bid_p1, bid_v1, ask_p2, ask_v2, bid_p2, bid_v2, ...
+  (10 levels, so 40 columns total)
+  - prices are integer ticks (divide by 10000)
+  - each row = book state AFTER the corresponding message row fires
+  - rows are aligned 1:1 with the message file
+
+### Data Scope
+- One month of data (~21 trading days per stock)
+- Two stocks: AAPL (large-tick, high liquidity) and CSCO (different microstructure)
+- This gives sufficient data for intraday and day-of-week seasonality
+- NOT sufficient for monthly/quarterly or macro regime variation
+- Cross-stock generalization (train AAPL, test CSCO) is the robustness check
+  for the one-month data limitation
+
+---
+
+## LABEL CONSTRUCTION
+
+Simulate synthetic limit orders placed at the best bid (buy) or best ask (sell)
+at each new-limit-order event (event_type == 1). Label = 1 if filled within 5
+seconds, 0 otherwise.
+
+Fill condition:
+  - Buy order at bid_p1: filled if any future execution (event_type 4 or 5)
+    occurs at price >= entry_price within 5 seconds
+  - Sell order at ask_p1: filled if any future execution occurs at
+    price <= entry_price within 5 seconds
+
+Horizon: FILL_HORIZON = 5.0 seconds
+
+---
+
+## FEATURES
+
+All features computed at time t (moment of order placement). No future data.
+
+MICROSTRUCTURE FEATURES (primary drivers):
+  - imbalance: (bid_v1 - ask_v1) / (bid_v1 + ask_v1)  [bounded -1 to 1]
+  - depth_imbalance: same but summed over top 3 levels
+  - queue_ahead: volume at best level on order's side (bid_v1 or ask_v1)
+  - spread_norm: (ask_p1 - bid_p1) / mid_price  [stationary]
+  - local_vol: std of bid_p1 over past 30 seconds  [rolling]
+  - aggressive_flow: count of executions (event_type 4,5) in past 10 seconds
+  - direction: 1=buy, -1=sell
+
+INTRADAY SEASONALITY FEATURES (professor requirement):
+  - time_sin: sin(2*pi*minute_of_day/390)  [cyclical encoding]
+  - time_cos: cos(2*pi*minute_of_day/390)  [cyclical encoding]
+  - time_bucket: 0=open(<30min), 1=mid-morning, 2=midday, 3=close(>270min)
+  NOTE: raw minute_of_day should NOT be used directly — use sin/cos encoding
+
+REGIME PROXY:
+  - vol_regime: binary, 1 if local_vol > median(local_vol across training days)
+  NOTE: macro regime variables (VIX etc.) are theoretically second-order at
+        5-second horizon — their effect is subsumed by local microstructure
+        features. This is tested empirically in Experiment 2.
+
+DO NOT USE as features (non-stationary):
+  - raw price levels (mid_price, bid_p1, ask_p1)
+  - raw order IDs or timestamps as numeric values
+
+---
+
+## TRAIN/TEST SPLIT RULES
+
+CRITICAL: Never use random shuffling. LOBSTER data has serial autocorrelation.
+
+Chronological split by date:
+  - Train: first 70% of trading days
+  - Validation: next 15% of trading days
+  - Test: final 15% of trading days (held out until final evaluation)
+
+Purging at boundaries:
+  - Remove training samples whose 5-second label window extends into val period
+  - purge_cutoff = val_start - timedelta(seconds=5)
+
+Embargoing at boundaries:
+  - Drop first 30 seconds of val/test period after each boundary
+  - embargo_start = val_start + timedelta(seconds=30)
+
+Cross-validation:
+  - Use sklearn TimeSeriesSplit(n_splits=5, gap=500) for hyperparameter tuning
+  - gap=500 rows approximates the embargo buffer in event-time
+
+---
+
+## FEATURE SELECTION (from Assignment 2, adapted for time series)
+
+Three methods — all using TimeSeriesSplit instead of random k-fold:
+
+1. Mutual Information (mutual_info_classif)
+   - Run on training fold only
+   - Produces ranked feature importance plot
+   - Primary proof for professor that intraday features > macro regime features
+
+2. RFE with TimeSeriesSplit CV (RFECV)
+   - Base estimator: LogisticRegression
+   - cv=TimeSeriesSplit(n_splits=5, gap=500)
+   - scoring='roc_auc'
+
+3. Genetic Algorithm (reuse A2 implementation)
+   - Fitness function must use TimeSeriesSplit CV internally
+   - Penalize feature count as in A2
+   - Include macro regime vars as candidates — if GA drops them, that's proof
+
+---
+
+## MODELS
+
+Three models trained on GA/RFE selected feature set:
+  1. Logistic Regression — interpretable coefficients, baseline
+  2. Random Forest (n_estimators=200) — feature importances
+  3. Gradient Boosting — best expected performance
+
+Keep all models interpretable. No deep learning. This is a microstructure
+project, not an ML project. Interpretability > accuracy.
+
+---
+
+## EVALUATION METRICS
+
+Primary: ROC-AUC (robust to class imbalance)
+Secondary: Brier score (measures probability calibration)
+Visual: Calibration curve (predicted fill prob vs. actual fill rate in bins)
+
+Report metrics aggregated at the DAY level for standard errors, not tick level.
+Tick-level standard errors are severely underestimated due to autocorrelation.
+
+---
+
+## EXPERIMENTS (three required for paper)
+
+Experiment 1 — Does intraday seasonality matter?
+  Model A: microstructure features only (no time features)
+  Model B: microstructure + time_sin + time_cos + time_bucket
+  Compare ROC-AUC on test set. Expected: B > A by 2-5%.
+
+Experiment 2 — Do macro regime variables add anything?
+  Model A: microstructure + intraday features only
+  Model B: Model A + vol_regime + day_of_week
+  Compare ROC-AUC. Expected: negligible difference (<1%).
+  This is the empirical proof that macro effects are subsumed at 5-second horizon.
+  Complement with: regress Model A residuals on macro variables, test significance.
+
+Experiment 3 — Cross-stock generalization (robustness check)
+  Train on AAPL, test on CSCO (and vice versa)
+  This compensates for one-month data limitation.
+  If model generalizes, it learned real microstructure, not AAPL-specific noise.
+
+---
+
+## PAPER STRUCTURE (CMU Data Science course format)
+
+Section 1 — Problem and motivation
+Section 2 — Data and label construction
+Section 3 — Feature engineering (justify stationarity of each feature)
+Section 4 — Feature selection methodology (cite A2 methods + time-series adaptation)
+             cite: Lopez de Prado (2018), Advances in Financial Machine Learning, Ch.7
+             for purging/embargoing methodology
+Section 5 — Model training and evaluation
+Section 6 — Experiments 1, 2, 3
+Section 7 — Conclusion and limitations (explicitly state: one month insufficient
+             for macro regime variation; cross-stock check as mitigation)
+
+---
+
+## PROJECT CONTEXT (for LOB + MM simulator, not for the course paper)
+
+This fill estimator is Phase 3 of a larger LOB + Market Making simulator:
+  Phase 1: Matching engine (deterministic, price-time priority)
+  Phase 2: Avellaneda-Stoikov market making strategy with inventory skewing
+  Phase 3: Fill probability estimator (this project)
+  Phase 4: EV-based quoting using fill probability
+
+The estimator is a standalone FillEstimator class that the MM strategy calls:
+  fill_prob = estimator.predict_proba(state_features)
+  EV = fill_prob * expected_spread_capture - (1-fill_prob) * inventory_cost
+
+Keep the class interface clean and decoupled from the matching engine.
+
+---
+
+## TECH STACK
+
+Python 3.x
+pandas, numpy — data loading and feature engineering
+sklearn — feature selection, models, TimeSeriesSplit, metrics
+matplotlib/plotly — calibration curve, feature importance plots
+No PyTorch, no deep learning
+
+---
+
+## KEY CONSTRAINTS
+
+- One-month data scope: sufficient for intraday + day-of-week, not macro regimes
+- 5-second fill horizon: macro regime effects are second-order at this timescale
+- Interpretability required: prop shop interviews require you to explain the model
+- No random shuffling anywhere in the pipeline
+- All features must be computable in real-time (no future data)
+- AAPL and CSCO have different microstructures — this is a feature, not a bug
+
+---
+
+## REFERENCES
+
+Avellaneda & Stoikov (2008) — High-Frequency Trading in a Limit Order Book
+Guéant, Lehalle & Fernandez-Tapia (2013) — Dealing with the Inventory Risk
+Hasbrouck — Empirical Market Microstructure (spread decomposition)
+Cartea, Jaimungal & Penalva — Algorithmic and High-Frequency Trading, Ch.1-2
+Columbia Deep LOB paper (2021) — fill probability estimation methodology
+Lopez de Prado (2018) — Advances in Financial Machine Learning, Ch.7 (purging)
