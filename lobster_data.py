@@ -184,18 +184,25 @@ def compute_features(msg: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
     of local_vol and must be fitted on training data then applied with
     apply_vol_regime().
     """
-    # ── Book-state features (vectorized across all rows) ───────────────────────
-    bid_v1 = book["bid_v1"].values.astype(float)
-    ask_v1 = book["ask_v1"].values.astype(float)
-    bid_p1 = book["bid_p1"].values
-    ask_p1 = book["ask_p1"].values
+    # ── Book-state features — use PRE-event state (book[i-1]) ────────────────
+    # LOBSTER convention: book[i] = LOB state AFTER event i.  For a limit
+    # order at row i, book[i] already includes the order's own volume, so
+    # queue_ahead would overcount by sizes[i] for at-best submissions.
+    # Shifting by one gives the book state the trader observed before placing.
+    def _lag1(arr: np.ndarray) -> np.ndarray:
+        return np.concatenate([[arr[0]], arr[:-1]])
+
+    bid_v1 = _lag1(book["bid_v1"].values).astype(float)
+    ask_v1 = _lag1(book["ask_v1"].values).astype(float)
+    bid_p1 = _lag1(book["bid_p1"].values)
+    ask_p1 = _lag1(book["ask_p1"].values)
     mid    = (ask_p1 + bid_p1) / 2.0
 
     total_v1 = bid_v1 + ask_v1
     imbalance = np.where(total_v1 > 0, (bid_v1 - ask_v1) / total_v1, 0.0)
 
-    bid_v3 = sum(book[f"bid_v{i}"].values.astype(float) for i in range(1, 4))
-    ask_v3 = sum(book[f"ask_v{i}"].values.astype(float) for i in range(1, 4))
+    bid_v3 = sum(_lag1(book[f"bid_v{i}"].values).astype(float) for i in range(1, 4))
+    ask_v3 = sum(_lag1(book[f"ask_v{i}"].values).astype(float) for i in range(1, 4))
     total_v3 = bid_v3 + ask_v3
     depth_imbalance = np.where(total_v3 > 0,
                                (bid_v3 - ask_v3) / total_v3, 0.0)
@@ -206,9 +213,13 @@ def compute_features(msg: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
     spread_norm = np.where(mid > 0, (ask_p1 - bid_p1) / mid, 0.0)
 
     # ── Time-based rolling features (require DatetimeIndex) ───────────────────
+    # local_vol uses unlagged mid so that every LOB update (including event i)
+    # contributes to the volatility estimate — the rolling window looks backward
+    # in time and doesn't introduce forward leakage.
     ts_idx = pd.DatetimeIndex(msg["timestamp"])
 
-    mid_series  = pd.Series(mid, index=ts_idx)
+    mid_unlagged = (book["ask_p1"].values + book["bid_p1"].values) / 2.0
+    mid_series  = pd.Series(mid_unlagged, index=ts_idx)
     exec_series = pd.Series(
         msg["event_type"].isin([4, 5]).astype(float).values, index=ts_idx
     )
@@ -302,8 +313,13 @@ def construct_fill_labels(msg: pd.DataFrame,
     directions = msg["direction"].values
     bid_p1     = book["bid_p1"].values
     ask_p1     = book["ask_p1"].values
-    bid_v1     = book["bid_v1"].values                      # queue depth, buy side
-    ask_v1     = book["ask_v1"].values                      # queue depth, sell side
+    # Pre-placement queue depth: shift by 1 so book[i-1] is used.
+    # book[i] includes the order itself for at-best submissions, which would
+    # overcount the fill threshold by sizes[i].  book[i-1] = true queue ahead.
+    _bid_v1_raw = book["bid_v1"].values
+    _ask_v1_raw = book["ask_v1"].values
+    bid_v1     = np.concatenate([[_bid_v1_raw[0]], _bid_v1_raw[:-1]])
+    ask_v1     = np.concatenate([[_ask_v1_raw[0]], _ask_v1_raw[:-1]])
     timestamps = msg["timestamp"].values
 
     limit_idxs  = np.where(msg["event_type"].values == 1)[0]
@@ -318,7 +334,9 @@ def construct_fill_labels(msg: pd.DataFrame,
         entry_price = bid_p1[i] if d == 1 else ask_p1[i]
         entry_price_arr[k] = entry_price
 
-        # Volume needed to fully fill: clear queue ahead + fill this order
+        # Volume needed to fully fill: clear queue ahead + fill this order.
+        # queue_ahead uses pre-placement depth (bid_v1[i-1]) so the order's
+        # own size is not double-counted in the threshold.
         queue_ahead     = bid_v1[i] if d == 1 else ask_v1[i]
         fill_threshold  = int(queue_ahead) + int(sizes[i])
 
@@ -636,8 +654,10 @@ def construct_fill_fraction_labels(
     directions = msg["direction"].values
     bid_p1     = book["bid_p1"].values
     ask_p1     = book["ask_p1"].values
-    bid_v1     = book["bid_v1"].values
-    ask_v1     = book["ask_v1"].values
+    _bid_v1_raw = book["bid_v1"].values
+    _ask_v1_raw = book["ask_v1"].values
+    bid_v1     = np.concatenate([[_bid_v1_raw[0]], _bid_v1_raw[:-1]])
+    ask_v1     = np.concatenate([[_ask_v1_raw[0]], _ask_v1_raw[:-1]])
     timestamps = msg["timestamp"].values
 
     limit_idxs      = np.where(msg["event_type"].values == 1)[0]
@@ -651,7 +671,7 @@ def construct_fill_fraction_labels(
         entry_price = bid_p1[i] if d == 1 else ask_p1[i]
         entry_price_arr[k] = entry_price
 
-        queue_ahead = float(bid_v1[i] if d == 1 else ask_v1[i])
+        queue_ahead = float(bid_v1[i] if d == 1 else ask_v1[i])  # pre-placement
         order_sz    = float(sizes[i])
 
         lo = i + 1
