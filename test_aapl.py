@@ -35,6 +35,10 @@ AAPL_DIR = os.path.join(
     BASE, "Data", "AAPL_2023-07-01_2023-07-31_10",
     "output-2023-07", "0", "0", "13",
 )
+CSCO_DIR = os.path.join(
+    BASE, "Data", "CSCO_2023-07-01_2023-07-31_10",
+    "output-2023-07", "0", "0", "75",
+)
 MODELS_DIR = os.path.join(BASE, "models")
 PLOTS_DIR  = os.path.join(BASE, "plots")
 os.makedirs(PLOTS_DIR, exist_ok=True)
@@ -71,21 +75,28 @@ MODELS = {
 
 # ── Reconstruct the exact same split used in training ─────────────────────────
 
-print("Loading AAPL data and reconstructing train/val/test split …")
-files  = discover_files(AAPL_DIR)
-df     = build_dataset(files, "AAPL")
+print("Loading AAPL + CSCO data to reconstruct exact training split …")
+# Training split was done on the combined AAPL+CSCO dataframe sorted by date.
+# Splitting AAPL alone would place rows in different partitions — we must
+# reproduce the exact same combined sort before calling make_splits.
+aapl_files = discover_files(AAPL_DIR)
+df_aapl    = build_dataset(aapl_files, "AAPL")
+csco_files = discover_files(CSCO_DIR)
+df_csco    = build_dataset(csco_files, "CSCO")
 
-# make_splits is deterministic (chronological) so this is identical to training
-train_df, val_df, test_df = make_splits(df)
+df_combined = (pd.concat([df_aapl, df_csco], ignore_index=True)
+                 .sort_values("date")
+                 .reset_index(drop=True))
 
-# vol_regime: fit on training set (same as training) but we can also just use
-# the threshold stored in the estimator — they are the same value.
+_, _, test_raw = make_splits(df_combined)
+test_df = test_raw[test_raw["ticker"] == "AAPL"].copy().reset_index(drop=True)
+
 vol_threshold = VOL_THRESHOLD
 test_df = apply_vol_regime(test_df, vol_threshold)
 
-print(f"  Total AAPL rows : {len(df):,}")
+print(f"  Total AAPL rows : {len(df_aapl):,}")
 print(f"  Test split rows : {len(test_df):,}  "
-      f"({len(test_df)/len(df)*100:.1f} % of data)")
+      f"({len(test_df)/len(df_aapl)*100:.1f} % of AAPL data)")
 print(f"  Test fill rate  : {test_df['filled'].mean():.4f}")
 print(f"  Test dates      : {test_df['date'].min()} → {test_df['date'].max()}")
 
@@ -172,20 +183,6 @@ for name, res in results.items():
     cal_ratio = cal_pred / actual_fills
     print(f"  {name:<22}  {raw_ratio:>10.4f}  {cal_ratio:>10.4f}  "
           f"{raw_pred - actual_fills:>+10.0f}  {cal_pred - actual_fills:>+10.0f}")
-
-# ── Side-by-side comparison with CSCO ────────────────────────────────────────
-
-print("\n" + "=" * 65)
-print("AAPL test (in-stock) vs CSCO OOS (cross-stock) — GBM")
-print("=" * 65)
-gbm = results["GBM"]
-print(f"  {'Metric':<28}  {'AAPL test':>12}  {'CSCO OOS':>12}")
-print(f"  {'-'*56}")
-print(f"  {'Tick AUC':<28}  {gbm['tick_auc']:>12.4f}  {'0.7781':>12}")
-print(f"  {'Day AUC mean':<28}  {gbm['day_auc_mean']:>12.4f}  {'0.7752':>12}")
-print(f"  {'Day AUC std':<28}  {gbm['day_auc_std']:>12.4f}  {'0.0284':>12}")
-print(f"  {'Day Brier mean':<28}  {gbm['day_brier_mean']:>12.4f}  {'0.0578':>12}")
-print("=" * 65)
 
 # ── Plot: ROC curves ──────────────────────────────────────────────────────────
 

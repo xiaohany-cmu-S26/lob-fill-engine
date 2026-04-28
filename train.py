@@ -21,6 +21,7 @@ Pipeline (strict no-leakage order)
 """
 
 import os
+import json
 import time
 import warnings
 
@@ -629,6 +630,16 @@ def main() -> None:
               f"{split['date'].nunique():>2} days  "
               f"{split['date'].min()} → {split['date'].max()}  "
               f"fill={split['filled'].mean():.3f}")
+
+    split_dates = {
+        "train_dates": sorted(train_raw["date"].unique().tolist()),
+        "val_dates":   sorted(val_raw["date"].unique().tolist()),
+        "test_dates":  sorted(test_raw["date"].unique().tolist()),
+    }
+    split_path = os.path.join(MODELS_DIR, "split_dates.json")
+    with open(split_path, "w") as _f:
+        json.dump(split_dates, _f, indent=2)
+    print(f"  Split dates → {split_path}")
 
     # ── Step 3: Fit vol_regime on TRAINING SET ONLY, then apply ───────────────
     print("\n── Vol-regime threshold (fitted on training set only) ───────────────")
