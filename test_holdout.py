@@ -9,7 +9,7 @@ dates are strictly unseen by the training and validation steps.
 Reports per-ticker and combined:
   • Tick-level ROC-AUC
   • Day-level AUC mean ± std
-  • Day-level Brier score (raw and Platt-calibrated)
+  • Day-level Brier score (raw and temperature-calibrated)
   • Aggregate calibration bias ratio
 
 Plots  → plots/holdout_roc_curves.png
@@ -82,7 +82,7 @@ estimator: FillEstimator = FillEstimator.load(os.path.join(MODELS_DIR, "fill_est
 lr_model    = joblib.load(os.path.join(MODELS_DIR, "logistic_regression.pkl"))
 rf_model    = joblib.load(os.path.join(MODELS_DIR, "random_forest.pkl"))
 gbm_model   = joblib.load(os.path.join(MODELS_DIR, "gbm.pkl"))
-calibrators = joblib.load(os.path.join(MODELS_DIR, "platt_calibrators.pkl"))
+calibrators = joblib.load(os.path.join(MODELS_DIR, "temperature_calibrators.pkl"))
 
 FEATURE_NAMES = estimator.feature_names
 VOL_THRESHOLD = estimator.vol_threshold
@@ -198,7 +198,7 @@ def _print_results(label: str, df: pd.DataFrame, res: dict) -> None:
         print(f"  {name:<22}  {r['tick_auc']:>9.4f}  "
               f"{r['day_auc_m']:>6.4f} ± {r['day_auc_s']:.4f}  "
               f"{r['day_brier_m']:>6.4f} ± {r['day_brier_s']:.4f}")
-    print(f"\n  Platt-calibrated:")
+    print(f"\n  temperature-calibrated:")
     print(f"  {'-' * 66}")
     for name, r in res.items():
         print(f"  {name:<22}  {r['cal_tick_auc']:>9.4f}  "

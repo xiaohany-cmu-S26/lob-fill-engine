@@ -44,7 +44,7 @@ PLOTS_DIR  = os.path.join(BASE, "plots")
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 BG     = "#0f172a"; PANEL  = "#1e293b"; GRID = "#334155"
-TEXT   = "#e2e8f0"; COLORS = ["#38bdf8", "#f472b6", "#4ade80"]
+TEXT   = "#e2e8f0"; COLORS = ["#38bdf8", "#f472b6", "#4ade80", "#fb923c"]
 
 plt.rcParams.update({
     "figure.facecolor": BG,  "axes.facecolor": PANEL,
@@ -59,10 +59,11 @@ plt.rcParams.update({
 print("Loading trained models …")
 estimator: FillEstimator = FillEstimator.load(
     os.path.join(MODELS_DIR, "fill_estimator.pkl"))
-lr_model  = joblib.load(os.path.join(MODELS_DIR, "logistic_regression.pkl"))
-rf_model  = joblib.load(os.path.join(MODELS_DIR, "random_forest.pkl"))
-gbm_model = joblib.load(os.path.join(MODELS_DIR, "gbm.pkl"))
-calibrators = joblib.load(os.path.join(MODELS_DIR, "platt_calibrators.pkl"))
+lr_model   = joblib.load(os.path.join(MODELS_DIR, "logistic_regression.pkl"))
+rf_model   = joblib.load(os.path.join(MODELS_DIR, "random_forest.pkl"))
+gbm_model  = joblib.load(os.path.join(MODELS_DIR, "gbm.pkl"))
+lgbm_model = joblib.load(os.path.join(MODELS_DIR, "lightgbm.pkl"))
+calibrators = joblib.load(os.path.join(MODELS_DIR, "temperature_calibrators.pkl"))
 
 FEATURE_NAMES = estimator.feature_names
 VOL_THRESHOLD = estimator.vol_threshold
@@ -71,6 +72,7 @@ MODELS = {
     "Logistic Regression": lr_model,
     "Random Forest":       rf_model,
     "GBM":                 gbm_model,
+    "LightGBM":            lgbm_model,
 }
 
 # ── Reconstruct the exact same split used in training ─────────────────────────
@@ -154,7 +156,7 @@ for name, model in MODELS.items():
 print("=" * 65)
 
 # ── Calibrated metrics ────────────────────────────────────────────────────────
-print(f"\nPlatt-calibrated scores:")
+print(f"\ntemperature-calibrated scores:")
 print(f"{'Model':<22}  {'Tick AUC':>9}  {'Day AUC':>16}  {'Day Brier':>14}")
 print("-" * 65)
 for name, res in results.items():

@@ -47,7 +47,7 @@ BG      = "#0f172a"
 PANEL   = "#1e293b"
 GRID    = "#334155"
 TEXT    = "#e2e8f0"
-COLORS  = ["#38bdf8", "#f472b6", "#4ade80"]   # LR, RF, GBM
+COLORS  = ["#38bdf8", "#f472b6", "#4ade80", "#fb923c"]   # LR, RF, GBM, LightGBM
 
 plt.rcParams.update({
     "figure.facecolor": BG,
@@ -66,10 +66,11 @@ plt.rcParams.update({
 
 print("Loading trained models …")
 estimator: FillEstimator = FillEstimator.load(os.path.join(MODELS_DIR, "fill_estimator.pkl"))
-lr_model  = joblib.load(os.path.join(MODELS_DIR, "logistic_regression.pkl"))
-rf_model  = joblib.load(os.path.join(MODELS_DIR, "random_forest.pkl"))
-gbm_model = joblib.load(os.path.join(MODELS_DIR, "gbm.pkl"))
-calibrators = joblib.load(os.path.join(MODELS_DIR, "platt_calibrators.pkl"))
+lr_model   = joblib.load(os.path.join(MODELS_DIR, "logistic_regression.pkl"))
+rf_model   = joblib.load(os.path.join(MODELS_DIR, "random_forest.pkl"))
+gbm_model  = joblib.load(os.path.join(MODELS_DIR, "gbm.pkl"))
+lgbm_model = joblib.load(os.path.join(MODELS_DIR, "lightgbm.pkl"))
+calibrators = joblib.load(os.path.join(MODELS_DIR, "temperature_calibrators.pkl"))
 
 FEATURE_NAMES = estimator.feature_names
 VOL_THRESHOLD = estimator.vol_threshold
@@ -78,6 +79,7 @@ MODELS = {
     "Logistic Regression": lr_model,
     "Random Forest":       rf_model,
     "GBM":                 gbm_model,
+    "LightGBM":            lgbm_model,
 }
 
 # ── Load CSCO data ─────────────────────────────────────────────────────────────
@@ -157,7 +159,7 @@ for name, model in MODELS.items():
 
 print("=" * 65)
 
-# ── Calibrated metrics (Platt scaling) ───────────────────────────────────────
+# ── Calibrated metrics (temperature scaling) ───────────────────────────────────────
 print(f"\n{'Model':<22}  {'Tick AUC':>9}  {'Day AUC':>16}  {'Day Brier':>14}  {'Note':>12}")
 print("-" * 80)
 for name, res in results.items():
@@ -176,7 +178,7 @@ for name, res in results.items():
     results[name]["cal_day_auc_s"]  = day_auc_s
     print(f"{name:<22}  {tick_auc:>9.4f}  "
           f"{day_auc_m:>6.4f} ± {day_auc_s:.4f}  "
-          f"{day_brier_m:>6.4f} ± {day_brier_s:.4f}  Platt-cal")
+          f"{day_brier_m:>6.4f} ± {day_brier_s:.4f}  temp-cal")
 print("-" * 80)
 
 # ── Aggregate calibration check ───────────────────────────────────────────────
@@ -240,7 +242,7 @@ print(f"Saved {path}")
 
 # ── Plot 3: Per-day AUC (GBM) ────────────────────────────────────────────────
 
-tmp = prob_df[["date", "filled", "GBM"]].rename(columns={"GBM": "prob"})
+tmp = prob_df[["date", "filled", "LightGBM"]].rename(columns={"LightGBM": "prob"})
 day_aucs = {}
 for date, grp in tmp.groupby("date"):
     if grp["filled"].nunique() < 2:
@@ -252,13 +254,13 @@ aucs  = [day_aucs[d] for d in dates]
 
 fig, ax = plt.subplots(figsize=(10, 4))
 x = np.arange(len(dates))
-ax.bar(x, aucs, color=COLORS[2], alpha=0.85, width=0.6)
+ax.bar(x, aucs, color=COLORS[3], alpha=0.85, width=0.6)
 ax.axhline(np.mean(aucs), color=TEXT, lw=1.2, ls="--",
            label=f"Mean = {np.mean(aucs):.4f}")
 ax.set_xticks(x)
 ax.set_xticklabels([d[5:] for d in dates], rotation=45, ha="right", fontsize=8)
 ax.set_ylabel("ROC-AUC")
-ax.set_title("GBM Day-Level AUC — CSCO OOS (AAPL-trained)")
+ax.set_title("LightGBM Day-Level AUC — CSCO OOS")
 ax.set_ylim(0.4, 1.0)
 ax.legend(fontsize=9)
 ax.grid(True, axis="y", lw=0.5)

@@ -404,6 +404,7 @@ def build_dataset(file_pairs: list[dict],
         day_df["date"]        = date
         day_df["day_of_week"] = pd.Timestamp(date).day_of_week
 
+        day_df = add_derived_features(day_df)
         frames.append(day_df)
 
     if not frames:
@@ -502,6 +503,32 @@ def apply_vol_regime(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     Returns a copy of df with an added 'vol_regime' column (int 0/1).
     """
     return df.assign(vol_regime=(df["local_vol"] > threshold).astype(np.int8))
+
+
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Append three normalised ratio features that improve cross-stock generalisation.
+
+    Must be called after order_size is present (i.e. post build_dataset alignment).
+
+    queue_position_ratio : queue_ahead / (queue_ahead + order_size)
+        Fractional position in the queue; 0 = front, ~1 = far back.
+    queue_turnover       : aggressive_flow / max(queue_ahead, 1)
+        How quickly the queue is depleting relative to its current depth.
+    vol_in_spreads       : local_vol / max(spread_norm, 1e-6)
+        Volatility expressed in units of the current bid-ask spread.
+    """
+    qa = df["queue_ahead"].values.astype(float)
+    oz = df["order_size"].values.astype(float)
+    af = df["aggressive_flow"].values.astype(float)
+    sp = df["spread_norm"].values.astype(float)
+    lv = df["local_vol"].values.astype(float)
+
+    df = df.copy()
+    df["queue_position_ratio"] = qa / np.maximum(qa + oz, 1.0)
+    df["queue_turnover"]       = af / np.maximum(qa, 1.0)
+    df["vol_in_spreads"]       = lv / np.maximum(sp, 1e-6)
+    return df
 
 
 # ── Sample uniqueness weights (Lopez de Prado, AFML Ch. 4) ────────────────────
@@ -689,6 +716,7 @@ def build_dataset_fractional(
         day_df["date"]          = date
         day_df["day_of_week"]   = pd.Timestamp(date).day_of_week
 
+        day_df = add_derived_features(day_df)
         frames.append(day_df)
 
     if not frames:

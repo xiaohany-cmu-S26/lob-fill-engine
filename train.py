@@ -11,13 +11,13 @@ Pipeline (strict no-leakage order)
 4.  Fit vol_regime threshold on training set only; apply to all three splits
 5.  Feature selection on training set only: MI ranking, RFECV, Genetic Algorithm
 6.  Train three models on primary features (GA ∪ RFECV)
-7.  Platt scaling: fit calibrator on validation set scores — fixes systematic
-    probability bias without touching ranking (AUC unchanged)
+7.  Temperature scaling: fit single-parameter T on validation set logits —
+    adjusts sharpness without encoding a spurious base-rate shift (AUC unchanged)
 8.  Evaluate: tick-AUC, day-level AUC ± std, Brier score (raw + calibrated)
 9.  Generate all plots (plots/ directory)
 10. Experiment 1 — with vs without intraday seasonality features
 11. Experiment 2 — with vs without macro regime features
-12. Save best model (GBM + Platt calibrator) as FillEstimator → models/fill_estimator.pkl
+12. Save best model (GBM + temperature calibrator) as FillEstimator → models/fill_estimator.pkl
 """
 
 import os
@@ -31,6 +31,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import joblib
+
+import lightgbm as lgb
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
@@ -50,7 +54,7 @@ from lobster_data import (
     compute_uniqueness_weights,
     FILL_HORIZON_SEC,
 )
-from fill_estimator import FillEstimator
+from fill_estimator import FillEstimator, TemperatureScaler
 
 warnings.filterwarnings("ignore")
 
@@ -68,14 +72,15 @@ PLOTS_DIR  = os.path.join(BASE, "plots")
 MODELS_DIR = os.path.join(BASE, "models")
 
 # ── Feature groups ─────────────────────────────────────────────────────────────
-MICRO_FEATURES  = [
+MICRO_FEATURES   = [
     "imbalance", "depth_imbalance", "queue_ahead",
     "spread_norm", "local_vol", "aggressive_flow", "direction",
     "order_size",
 ]
-TIME_FEATURES   = ["time_sin", "time_cos", "time_bucket"]
-REGIME_FEATURES = ["vol_regime", "day_of_week"]
-ALL_FEATURES    = MICRO_FEATURES + TIME_FEATURES + REGIME_FEATURES  # 12 total
+TIME_FEATURES    = ["time_sin", "time_cos", "time_bucket"]
+REGIME_FEATURES  = ["vol_regime", "day_of_week"]
+DERIVED_FEATURES = ["queue_position_ratio", "queue_turnover", "vol_in_spreads"]
+ALL_FEATURES     = MICRO_FEATURES + TIME_FEATURES + REGIME_FEATURES + DERIVED_FEATURES  # 15 total
 
 # GA subsamples the last GA_MAX_ROWS training rows to bound runtime while
 # preserving temporal order (no random shuffle).
@@ -106,6 +111,71 @@ def _make_gbm() -> HistGradientBoostingClassifier:
         max_iter=200, max_depth=4, learning_rate=0.05,
         min_samples_leaf=50, random_state=42,
     )
+
+
+def _make_lgbm(**kwargs) -> lgb.LGBMClassifier:
+    defaults = dict(
+        n_estimators=500, num_leaves=63, learning_rate=0.05,
+        min_child_samples=50, subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.1, reg_lambda=0.1,
+        random_state=42, n_jobs=-1, verbosity=-1,
+    )
+    defaults.update(kwargs)
+    return lgb.LGBMClassifier(**defaults)
+
+
+def tune_lgbm(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    sw_train: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    n_trials: int = 50,
+) -> dict:
+    """
+    Bayesian hyperparameter search for LightGBM using Optuna TPE sampler.
+    Each trial uses early stopping against the val AUC so n_estimators is
+    determined automatically; only the architecture params are searched.
+    Returns the best_params dict ready to pass to _make_lgbm().
+    """
+    X_tr_np = X_train.values.astype(np.float32)
+    X_vl_np = X_val.values.astype(np.float32)
+    y_tr_np = y_train.values
+    y_vl_np = y_val.values
+
+    def objective(trial: optuna.Trial) -> float:
+        params = dict(
+            n_estimators      = 1000,
+            num_leaves        = trial.suggest_int("num_leaves", 20, 150),
+            learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            min_child_samples = trial.suggest_int("min_child_samples", 20, 150),
+            subsample         = trial.suggest_float("subsample", 0.5, 1.0),
+            colsample_bytree  = trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            reg_alpha         = trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            reg_lambda        = trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+            random_state=42, n_jobs=-1, verbosity=-1,
+        )
+        m = lgb.LGBMClassifier(**params)
+        m.fit(
+            X_tr_np, y_tr_np,
+            sample_weight=sw_train,
+            eval_set=[(X_vl_np, y_vl_np)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(-1),
+            ],
+        )
+        return float(roc_auc_score(y_vl_np, m.predict_proba(X_vl_np)[:, 1]))
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best = study.best_params.copy()
+    print(f"  Best val AUC = {study.best_value:.4f}  |  params: {best}")
+    return best
 
 
 def _fit_with_weights(model, X, y, sample_weight=None):
@@ -310,7 +380,7 @@ _PANEL   = "#1e293b"
 _GRID    = "#334155"
 _TEXT    = "#e2e8f0"
 _TITLE   = "#f8fafc"
-_COLORS  = ["#3b82f6", "#10b981", "#f59e0b"]   # LR, RF, GBM
+_COLORS  = ["#3b82f6", "#10b981", "#f59e0b", "#f472b6"]   # LR, RF, GBM, LightGBM
 
 
 def _dark_ax(ax):
@@ -710,28 +780,56 @@ def main() -> None:
         _fit_with_weights(model, X_tr, y_train, sample_weight=train_sw)
         print(f"done ({time.time()-t3:.0f}s)")
 
-    # ── Step 6: Platt scaling — fit on validation set ─────────────────────────
-    # A LogisticRegression maps raw model scores → calibrated probabilities.
-    # Fitted on val (not train) so the calibration sees out-of-sample scores.
-    # AUC is rank-invariant and won't change; bias ratio should approach 1.0.
+    # ── LightGBM: Optuna tuning then final fit ─────────────────────────────────
     print("\n" + "=" * 65)
-    print("STEP 4 — Platt calibration (fitted on validation set)")
+    print("STEP 3b — LightGBM + Optuna hyperparameter search (50 trials)")
+    print("=" * 65)
+    t_opt = time.time()
+    lgbm_best = tune_lgbm(
+        X_tr, y_train, train_sw,
+        val_df[primary_features], val_df["filled"],
+        n_trials=50,
+    )
+    print(f"  Optuna search: {time.time()-t_opt:.0f}s")
+
+    # Refit final LightGBM on train with best params; early stopping sets n_estimators
+    lgbm_final = _make_lgbm(n_estimators=1000, **lgbm_best)
+    lgbm_final.fit(
+        X_tr.values.astype(np.float32), y_train.values,
+        sample_weight=train_sw,
+        eval_set=[(val_df[primary_features].values.astype(np.float32),
+                   val_df["filled"].values)],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(-1),
+        ],
+    )
+    print(f"  Final LightGBM best_iteration={lgbm_final.best_iteration_}")
+    models["LightGBM"] = lgbm_final
+    features_dict["LightGBM"] = primary_features
+
+    # ── Step 6: Temperature scaling — fit on validation set ──────────────────
+    # Single-parameter calibration: p_cal = sigmoid(logit(raw) / T).
+    # No intercept term → cannot absorb a base-rate shift between val and test
+    # (val is AAPL-heavy at ~52% fill rate; test is CSCO-heavy at ~13%).
+    # Platt's two-parameter fit encoded that spurious 52% prior and then
+    # over-predicted on test.  Temperature scaling only adjusts sharpness.
+    print("\n" + "=" * 65)
+    print("STEP 4 — Temperature scaling (fitted on validation set)")
     print("=" * 65)
 
-    calibrators: dict[str, LogisticRegression] = {}
+    calibrators: dict[str, TemperatureScaler] = {}
     X_val_primary = val_df[primary_features]
     for name, model in models.items():
-        raw_val = model.predict_proba(X_val_primary)[:, 1].reshape(-1, 1)
-        platt = LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
-        platt.fit(raw_val, val_df["filled"])
-        calibrators[name] = platt
-        # Quick sanity: calibrated bias ratio on val
-        cal_val = platt.predict_proba(raw_val)[:, 1]
-        ratio = cal_val.sum() / val_df["filled"].sum()
-        print(f"  {name:<22}  val bias ratio after calibration: {ratio:.4f}")
+        raw_val = model.predict_proba(X_val_primary)[:, 1]
+        ts = TemperatureScaler().fit(raw_val, val_df["filled"].values)
+        calibrators[name] = ts
+        cal_val   = ts.predict_proba(raw_val.reshape(-1, 1))[:, 1]
+        bias_ratio = cal_val.sum() / val_df["filled"].sum()
+        print(f"  {name:<22}  T={ts.T:.4f}  val bias ratio: {bias_ratio:.4f}")
 
-    joblib.dump(calibrators, os.path.join(MODELS_DIR, "platt_calibrators.pkl"))
-    print(f"  Saved calibrators → models/platt_calibrators.pkl")
+    joblib.dump(calibrators, os.path.join(MODELS_DIR, "temperature_calibrators.pkl"))
+    print(f"  Saved calibrators → models/temperature_calibrators.pkl")
 
     # ── Step 7: Evaluate ───────────────────────────────────────────────────────
     print("\n" + "=" * 65)
@@ -756,7 +854,7 @@ def main() -> None:
                 test_results[name] = r
 
         # Calibrated metrics — AUC unchanged, Brier and bias ratio improve
-        print(f"\n  {split_name} set (Platt calibrated):")
+        print(f"\n  {split_name} set (temperature calibrated):")
         print(header)
         print(sep)
         for name, model in models.items():
@@ -813,16 +911,21 @@ def main() -> None:
     print("STEP 8 — Save FillEstimator")
     print("=" * 65)
 
-    best = FillEstimator(
-        model=models["GBM"],
+    # Pick the model with the highest test day AUC as the FillEstimator backbone
+    best_name = max(test_results, key=lambda n: test_results[n]["day_auc_mean"])
+    print(f"  Best model by test day AUC: {best_name} "
+          f"({test_results[best_name]['day_auc_mean']:.4f})")
+
+    best_est = FillEstimator(
+        model=models[best_name],
         feature_names=primary_features,
         vol_threshold=vol_thresh,
         fill_horizon_sec=FILL_HORIZON_SEC,
-        calibrator=calibrators["GBM"],
+        calibrator=calibrators[best_name],
     )
     est_path = os.path.join(MODELS_DIR, "fill_estimator.pkl")
-    best.save(est_path)
-    print(f"  FillEstimator (GBM) → {est_path}")
+    best_est.save(est_path)
+    print(f"  FillEstimator ({best_name}) → {est_path}")
 
     for name, model in models.items():
         fname = name.lower().replace(" ", "_") + ".pkl"

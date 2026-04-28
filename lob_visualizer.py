@@ -22,7 +22,7 @@ from dash import dcc, html, Input, Output
 import plotly.graph_objects as go
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.abspath(_-_file__))
 
 TICKER_DIRS = {
     "AAPL": os.path.join(BASE, "Data", "AAPL_2023-07-01_2023-07-31_10",

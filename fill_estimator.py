@@ -42,6 +42,46 @@ Usage
 import numpy as np
 import pandas as pd
 import joblib
+from scipy.optimize import minimize_scalar
+
+
+class TemperatureScaler:
+    """
+    Single-parameter post-hoc calibrator.
+
+    Fits temperature T on validation logits by minimising binary cross-entropy:
+        p_cal = sigmoid(logit(raw_prob) / T)
+
+    T > 1  →  soften predictions (push toward 0.5)
+    T < 1  →  sharpen predictions (push away from 0.5)
+    T = 1  →  identity
+
+    One free parameter vs Platt's two (slope + intercept).  The absence of an
+    intercept means it cannot encode a spurious base-rate shift when the
+    calibration set has a very different fill rate from the deployment set.
+    """
+
+    def __init__(self):
+        self.T: float = 1.0
+
+    def fit(self, raw_probs: np.ndarray, y: np.ndarray) -> "TemperatureScaler":
+        raw    = np.clip(raw_probs.ravel(), 1e-7, 1 - 1e-7)
+        logits = np.log(raw / (1 - raw))
+        y      = np.asarray(y, dtype=np.float64)
+
+        def nll(T: float) -> float:
+            p = np.clip(1.0 / (1.0 + np.exp(-logits / T)), 1e-7, 1 - 1e-7)
+            return -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+        res    = minimize_scalar(nll, bounds=(0.05, 20.0), method="bounded")
+        self.T = float(res.x)
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Drop-in replacement for sklearn's predict_proba.  X is (n, 1) raw probs."""
+        raw = np.clip(X.ravel(), 1e-7, 1 - 1e-7)
+        p   = 1.0 / (1.0 + np.exp(-np.log(raw / (1 - raw)) / self.T))
+        return np.column_stack([1 - p, p])
 
 
 # Trading-session constants (NASDAQ regular session)
@@ -91,9 +131,10 @@ class FillEstimator:
     feature_names    : ordered list of feature columns the model expects
     vol_threshold    : training-set median of local_vol (for vol_regime inference)
     fill_horizon_sec : labelled fill window (seconds) — embedded for traceability
-    calibrator       : optional Platt scaler (LogisticRegression on raw scores)
-                       fitted on the validation set; corrects systematic bias in
-                       the raw predicted probabilities without changing ranking
+    calibrator       : optional TemperatureScaler fitted on the validation set;
+                       rescales logits by a single parameter T without shifting
+                       the base rate, avoiding overfitting on calibration sets
+                       whose fill rate differs from the deployment distribution
     """
 
     def __init__(
@@ -108,7 +149,7 @@ class FillEstimator:
         self.feature_names    = feature_names
         self.vol_threshold    = vol_threshold
         self.fill_horizon_sec = fill_horizon_sec
-        self.calibrator       = calibrator   # None → raw scores, otherwise Platt
+        self.calibrator       = calibrator   # None → raw scores, otherwise TemperatureScaler
 
     def _apply_calibrator(self, raw: np.ndarray) -> np.ndarray:
         if self.calibrator is None:
@@ -123,7 +164,7 @@ class FillEstimator:
         already contains every encoded column the model expects.
 
         vol_regime is inferred from local_vol if omitted.
-        Applies Platt calibration automatically if a calibrator is stored.
+        Applies temperature calibration automatically if a calibrator is stored.
         """
         s = dict(state)
         if "vol_regime" not in s and "local_vol" in s:
@@ -137,7 +178,7 @@ class FillEstimator:
         Batch fill probabilities for backtesting.
 
         df must have all feature columns; vol_regime is inferred if absent.
-        Applies Platt calibration automatically if a calibrator is stored.
+        Applies temperature calibration automatically if a calibrator is stored.
         """
         df = df.copy()
         if "vol_regime" not in df.columns and "local_vol" in df.columns:
