@@ -1,3 +1,6 @@
 Data/
 __pycache__/
 *.pyc
+*.csv
+*.pkl
+
