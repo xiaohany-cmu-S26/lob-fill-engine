@@ -1,0 +1,21 @@
+# Raw LOBSTER data (licensed, multi-GB)
+Data/
+*.csv
+!order_size_fill_summary.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Local tooling / notes
+.claude/
+context.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
